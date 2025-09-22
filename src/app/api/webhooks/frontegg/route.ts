@@ -1,4 +1,5 @@
 // app/api/webhooks/frontegg/route.ts
+import jwt from 'jsonwebtoken';
 import type { NextRequest } from 'next/server';
 
 export const runtime = 'nodejs';
@@ -25,9 +26,20 @@ const BULK_INVITE_URL = (tenantId: string) =>
 // ---------- Helpers
 
 function verifySecret(req: NextRequest) {
-  const incoming = req.headers.get('x-webhook-secret') || '';
-  const expected = process.env.FRONTEGG_WEBHOOK_SECRET || '';
-  return Boolean(incoming) && incoming === expected;
+  const header = req.headers.get('x-webhook-secret') || ''; // Frontegg sets this
+  const secret = process.env.FRONTEGG_WEBHOOK_SECRET || '';
+  if (!header || !secret) return false;
+
+  // 1) Plain pre-shared key mode (exact match)
+  if (header === secret) return true;
+
+  // 2) Signed token mode (JWT signed with your secret)
+  try {
+    jwt.verify(header, secret); // throws if invalid
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function getVendorToken() {
