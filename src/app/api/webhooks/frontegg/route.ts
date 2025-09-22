@@ -13,6 +13,7 @@ export const dynamic = 'force-dynamic';
  *  - FRONTEGG_WEBHOOK_SECRET        (PSK or JWT signing key; sent in x-webhook-secret)
  * Optional:
  *  - DEFAULT_APP_ID                 (assign app -> tenant)
+ *  - DEFAULT_SRC_TENANT_ID          (source tenant for removal)
  *  - DRY_RUN=1                      (skip external API calls for debugging)
  */
 
@@ -27,9 +28,11 @@ const TENANTS_V1_URL  = `${REGION}/tenants/resources/tenants/v1`;
 const APP_ASSIGN_URL  = (appId: string) =>
   `${REGION}/applications/resources/applications/tenant-assignments/v1/${appId}`;
 
-// User attach (by userId)
+// User attach to tenant and removal from a tenant
 const ADD_USER_TO_TENANT_URL = (userId: string) =>
   `${REGION}/identity/resources/users/v1/${encodeURIComponent(userId)}/tenant`;
+const REMOVE_USER_URL = (userId: string) =>
+  `${REGION}/identity/resources/users/v1/${encodeURIComponent(userId)}`;
 
 const DRY_RUN = process.env.DRY_RUN === '1';
 
@@ -75,10 +78,7 @@ function labelFromDomain(domain: string) {
   const label = domain.split('.')[0] || domain;
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
-function looksLikeUuid(id?: string) {
-  if (!id) return false;
-  return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(id);
-}
+// No UUID heuristic required; we just ensure userId exists
 
  function extractEvent(payload: unknown) {
   // Accept both:
@@ -86,6 +86,9 @@ function looksLikeUuid(id?: string) {
   //  - { eventKey: 'frontegg.user.signedUp', user, tenant? }
   const obj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
   const data = obj['data'] && typeof obj['data'] === 'object' ? (obj['data'] as Record<string, unknown>) : undefined;
+  const context = obj['eventContext'] && typeof obj['eventContext'] === 'object'
+    ? (obj['eventContext'] as Record<string, unknown>)
+    : undefined;
   const user = data?.['user'] && typeof data['user'] === 'object'
     ? (data['user'] as Record<string, unknown>)
     : obj['user'] && typeof obj['user'] === 'object'
@@ -100,7 +103,9 @@ function looksLikeUuid(id?: string) {
   const key = typeof obj['key'] === 'string' ? (obj['key'] as string)
     : typeof obj['eventKey'] === 'string' ? (obj['eventKey'] as string)
     : '';
-  const userId = user && typeof user['id'] === 'string' ? (user['id'] as string) : undefined;
+  const userIdFromContext = context && typeof context['userId'] === 'string' ? (context['userId'] as string) : undefined;
+  const userIdFromUser = user && typeof user['id'] === 'string' ? (user['id'] as string) : undefined;
+  const userId = userIdFromContext ?? userIdFromUser;
   const email = user && typeof user['email'] === 'string' ? (user['email'] as string).trim() : undefined;
   const name = user && typeof user['name'] === 'string' ? (user['name'] as string).trim() : undefined;
   const prehookTenantName = tenant && typeof tenant['name'] === 'string' ? (tenant['name'] as string).trim() : undefined;
@@ -202,21 +207,25 @@ async function addUserToTenantById(token: string, userId: string, tenantId: stri
     cache: 'no-store',
   });
   if (res.ok) return;
-
-  // Handle common idempotent states gracefully
-  if (res.status === 409) {
-    // Already in tenant
-    return;
-  }
-
+  if (res.status === 409) return; // already in tenant
   const body = await readJsonOrText(res);
-  // Some tests send "user-id" placeholder; Frontegg returns 404 ER-01089
-  if (res.status === 404) {
-    console.warn(`ADD_USER_TO_TENANT 404 (User not found). userId="${userId}" body=${JSON.stringify(body)}`);
-    return; // acknowledge to avoid webhook retries
-  }
-
   throw new Error(`ADD_USER_TO_TENANT ${res.status} – ${JSON.stringify(body)}`);
+}
+
+async function removeUserFromTenant(token: string, userId: string, tenantId: string) {
+  const res = await fetch(REMOVE_USER_URL(userId), {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'frontegg-tenant-id': tenantId,
+    },
+    cache: 'no-store',
+  });
+  if (res.ok) return;
+  if (res.status === 404) return; // user not found in that tenant, treat as done
+  const body = await readJsonOrText(res);
+  throw new Error(`REMOVE_USER ${res.status} – ${JSON.stringify(body)}`);
 }
 
 // -------------------- route handlers
@@ -255,7 +264,7 @@ export async function POST(req: NextRequest) {
 
   // Optional dry-run
   if (DRY_RUN) {
-    console.log('[DRY_RUN] Would ensure tenant "%s"; then add userId=%s (%s)', tenantName, userId, email);
+    console.log('[DRY_RUN] Would ensure tenant "%s"; then add user to target and remove from "%s"', tenantName, process.env.DEFAULT_SRC_TENANT_ID ?? 'MISSING');
     return new Response('OK (dry run)', { status: 200 });
   }
 
@@ -266,12 +275,16 @@ export async function POST(req: NextRequest) {
 
     await ensureAppAssigned(token, tenant.tenantId);
 
-    // Attach by userId only (no bulk invite path)
-    if (looksLikeUuid(userId)) {
-      await addUserToTenantById(token, userId!, tenant.tenantId);
+    if (userId) {
+      await addUserToTenantById(token, userId, tenant.tenantId);
+      const srcTenantId = process.env.DEFAULT_SRC_TENANT_ID;
+      if (srcTenantId) {
+        await removeUserFromTenant(token, userId, srcTenantId);
+      } else {
+        console.warn('DEFAULT_SRC_TENANT_ID not set; skipping removal from default tenant');
+      }
     } else {
-      // If the payload uses a placeholder like "user-id", log and acknowledge.
-      console.warn(`Invalid or missing userId "${userId}". Skipping attach for ${email}.`);
+      console.warn('Missing userId; cannot add or remove user from tenants');
     }
 
     return new Response('OK', { status: 200 });
