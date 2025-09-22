@@ -1,6 +1,5 @@
 // app/api/webhooks/frontegg/route.ts
 import type { NextRequest } from 'next/server';
-import jwt from 'jsonwebtoken';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -33,8 +32,16 @@ const ADD_USER_TO_TENANT_URL = (userId: string) =>
   `${REGION}/identity/resources/users/v1/${encodeURIComponent(userId)}/tenant`;
 const REMOVE_USER_URL = (userId: string) =>
   `${REGION}/identity/resources/users/v1/${encodeURIComponent(userId)}`;
+// Tenant users utilities
+const TENANT_USERS_URL = `${REGION}/identity/resources/users/v3`;
+const DISABLE_USER_URL = (userId: string) =>
+  `${REGION}/identity/resources/tenants/users/v1/${encodeURIComponent(userId)}/disable`;
 
 const DRY_RUN = process.env.DRY_RUN === '1';
+
+// -------- Vendor token cache (6h TTL)
+const VENDOR_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
+let vendorTokenCache: { token: string; expiresAt: number } | null = null;
 
 // -------------------- helpers
 
@@ -42,17 +49,7 @@ function verifySecret(req: NextRequest) {
   const header = req.headers.get('x-webhook-secret') || '';
   const secret = process.env.FRONTEGG_WEBHOOK_SECRET || '';
   if (!header || !secret) return false;
-
-  // Plain PSK
-  if (header === secret) return true;
-
-  // JWT signed with the same secret
-  try {
-    jwt.verify(header, secret);
-    return true;
-  } catch {
-    return false;
-  }
+  return header === secret;
 }
 
 async function readJson(req: NextRequest) {
@@ -106,16 +103,24 @@ function labelFromDomain(domain: string) {
   const userIdFromContext = context && typeof context['userId'] === 'string' ? (context['userId'] as string) : undefined;
   const userIdFromUser = user && typeof user['id'] === 'string' ? (user['id'] as string) : undefined;
   const userId = userIdFromContext ?? userIdFromUser;
+  const contextAppId: string | undefined =
+    context && typeof context['applicationId'] === 'string'
+      ? (context['applicationId'] as string)
+      : undefined;
   const email = user && typeof user['email'] === 'string' ? (user['email'] as string).trim() : undefined;
-  const name = user && typeof user['name'] === 'string' ? (user['name'] as string).trim() : undefined;
   const prehookTenantName = tenant && typeof tenant['name'] === 'string' ? (tenant['name'] as string).trim() : undefined;
 
-  return { key, userId, email, name, prehookTenantName };
+  return { key, userId, email, prehookTenantName, contextAppId };
 }
 
 // -------------------- Frontegg API
 
 async function getVendorToken() {
+  const now = Date.now();
+  if (vendorTokenCache && vendorTokenCache.expiresAt > now) {
+    return vendorTokenCache.token;
+  }
+
   const clientId = process.env.FRONTEGG_CLIENT_ID;
   const secret   = process.env.FRONTEGG_API_KEY;
   if (!clientId || !secret) throw new Error('CONFIG: Missing FRONTEGG_CLIENT_ID or FRONTEGG_API_KEY');
@@ -132,7 +137,12 @@ async function getVendorToken() {
   }
   const json = (await res.json()) as { token?: string };
   if (!json?.token) throw new Error('AUTH_VENDOR: token missing');
-  return json.token!;
+
+  vendorTokenCache = {
+    token: json.token!,
+    expiresAt: now + VENDOR_TOKEN_TTL_MS,
+  };
+  return vendorTokenCache.token;
 }
 
 async function findTenantByName(token: string, name: string) {
@@ -228,6 +238,50 @@ async function removeUserFromTenant(token: string, userId: string, tenantId: str
   throw new Error(`REMOVE_USER ${res.status} – ${JSON.stringify(body)}`);
 }
 
+async function isSecondOrLaterUserInTenant(token: string, tenantId: string) {
+  const url = new URL(TENANT_USERS_URL);
+  // Try offset/limit style pagination to check if a second user exists
+  url.searchParams.set('offset', '1');
+  url.searchParams.set('limit', '1');
+  const res = await fetch(url.toString(), {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'frontegg-tenant-id': tenantId,
+    },
+    cache: 'no-store',
+  });
+  if (!res.ok) {
+    const body = await readJsonOrText(res);
+    throw new Error(`TENANT_USERS ${res.status} – ${JSON.stringify(body)}`);
+  }
+  const payload: unknown = await res.json();
+  // Consider it second-or-later if any item is returned at offset 1
+  if (Array.isArray(payload)) return payload.length > 0;
+  if (payload && typeof payload === 'object') {
+    const items = (payload as Record<string, unknown>)['items'];
+    return Array.isArray(items) && items.length > 0;
+  }
+  return false;
+}
+
+async function disableUserInTenant(token: string, tenantId: string, userId: string) {
+  const res = await fetch(DISABLE_USER_URL(userId), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'frontegg-tenant-id': tenantId,
+    },
+    cache: 'no-store',
+  });
+  if (!res.ok) {
+    const body = await readJsonOrText(res);
+    throw new Error(`DISABLE_USER ${res.status} – ${JSON.stringify(body)}`);
+  }
+}
+
 // -------------------- route handlers
 
 export async function GET() {
@@ -246,7 +300,7 @@ export async function POST(req: NextRequest) {
     return new Response('Bad JSON', { status: 400 });
   }
 
-  const { key, userId, email, prehookTenantName } = extractEvent(payload);
+  const { key, userId, email, prehookTenantName, contextAppId } = extractEvent(payload);
 
   // Only act on the "user signed up" event
   if (key !== 'frontegg.user.signedUp') {
@@ -283,8 +337,17 @@ export async function POST(req: NextRequest) {
       } else {
         console.warn('DEFAULT_SRC_TENANT_ID not set; skipping removal from default tenant');
       }
+
+      // Final step: auto-disable if appId matches default app and user isn't first in target tenant
+      const defaultAppId = process.env.DEFAULT_APP_ID;
+      if (defaultAppId && contextAppId && contextAppId === defaultAppId) {
+        const notFirst = await isSecondOrLaterUserInTenant(token, tenant.tenantId);
+        if (notFirst) {
+          await disableUserInTenant(token, tenant.tenantId, userId);
+        }
+      }
     } else {
-      console.warn('Missing userId; cannot add or remove user from tenants');
+      console.warn('Missing userId; cannot add/remove/disable user in tenants');
     }
 
     return new Response('OK', { status: 200 });
