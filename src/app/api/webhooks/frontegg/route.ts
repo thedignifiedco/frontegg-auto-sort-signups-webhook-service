@@ -10,39 +10,40 @@ export const dynamic = 'force-dynamic';
  *  - FRONTEGG_CLIENT_ID
  *  - FRONTEGG_API_KEY
  *  - FRONTEGG_REGION_BASE           (e.g., https://api.frontegg.com)
- *  - FRONTEGG_WEBHOOK_SECRET        (PSK or signing key; sent in x-webhook-secret)
+ *  - FRONTEGG_WEBHOOK_SECRET        (PSK or JWT signing key; sent in x-webhook-secret)
  * Optional:
  *  - DEFAULT_APP_ID                 (assign app -> tenant)
- *  - DRY_RUN=1                      (skip API calls for debugging)
+ *  - DRY_RUN=1                      (skip external API calls for debugging)
  */
 
 const REGION = process.env.FRONTEGG_REGION_BASE ?? 'https://api.frontegg.com';
+
+// Auth
 const AUTH_VENDOR_URL = `${REGION}/auth/vendor`;
+
+// Tenants
 const TENANTS_V2_URL  = `${REGION}/tenants/resources/tenants/v2`;
 const TENANTS_V1_URL  = `${REGION}/tenants/resources/tenants/v1`;
 const APP_ASSIGN_URL  = (appId: string) =>
   `${REGION}/applications/resources/applications/tenant-assignments/v1/${appId}`;
 
-// Fallback-only (if userId is missing): correct bulk invite endpoint + tenant header
-const USERS_BULK_INVITE_URL = `${REGION}/identity/resources/users/bulk/v1/invite`;
-
-// Option B primary endpoint: add an existing user to a tenant by userId
+// User attach (by userId)
 const ADD_USER_TO_TENANT_URL = (userId: string) =>
   `${REGION}/identity/resources/users/v1/${encodeURIComponent(userId)}/tenant`;
 
 const DRY_RUN = process.env.DRY_RUN === '1';
 
-// ---------- Utils
+// -------------------- helpers
 
 function verifySecret(req: NextRequest) {
   const header = req.headers.get('x-webhook-secret') || '';
   const secret = process.env.FRONTEGG_WEBHOOK_SECRET || '';
   if (!header || !secret) return false;
 
-  // 1) Plain PSK equality
+  // Plain PSK
   if (header === secret) return true;
 
-  // 2) JWT signed with the secret
+  // JWT signed with the same secret
   try {
     jwt.verify(header, secret);
     return true;
@@ -51,62 +52,69 @@ function verifySecret(req: NextRequest) {
   }
 }
 
-async function getBody(req: NextRequest) {
-  // Use text() then JSON.parse() to avoid body-lock with earlier reads
+async function readJson(req: NextRequest) {
   const raw = await req.text();
   return JSON.parse(raw);
 }
 
-function deriveTenantNameFromEmail(email: string) {
-  const domain = email.split('@')[1]?.toLowerCase() || 'unknown';
-  const label = domain.split('.')[0] || domain;
-  return label.charAt(0).toUpperCase() + label.slice(1);
-}
-
- function extractEventInfo(payload: unknown) {
-   // Accept both shapes:
-   //  - { key: 'frontegg.user.signedUp', data: { user, tenant? } }
-   //  - { eventKey: 'frontegg.user.signedUp', user, tenant?, eventContext? }
-   const obj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
-   const data = obj['data'] && typeof obj['data'] === 'object' ? (obj['data'] as Record<string, unknown>) : undefined;
-   const user = data?.['user'] && typeof data['user'] === 'object'
-     ? (data['user'] as Record<string, unknown>)
-     : obj['user'] && typeof obj['user'] === 'object'
-       ? (obj['user'] as Record<string, unknown>)
-       : undefined;
-   const tenant = data?.['tenant'] && typeof data['tenant'] === 'object'
-     ? (data['tenant'] as Record<string, unknown>)
-     : obj['tenant'] && typeof obj['tenant'] === 'object'
-       ? (obj['tenant'] as Record<string, unknown>)
-       : undefined;
-
-   const key = typeof obj['key'] === 'string' ? (obj['key'] as string)
-     : typeof obj['eventKey'] === 'string' ? (obj['eventKey'] as string)
-     : '';
-   const userId = user && typeof user['id'] === 'string' ? (user['id'] as string) : undefined;
-   const email = user && typeof user['email'] === 'string' ? (user['email'] as string).trim() : undefined;
-   const name = user && typeof user['name'] === 'string' ? (user['name'] as string).trim() : undefined;
-   const prehookTenantName = tenant && typeof tenant['name'] === 'string' ? (tenant['name'] as string).trim() : undefined;
-
-   return { key, userId, email, name, prehookTenantName };
- }
-
-async function fetchJsonOrText(res: Response) {
+function fetchIsJson(res: Response) {
   const ct = res.headers.get('content-type') || '';
-  if (ct.includes('application/json')) {
-    try { return await res.json(); } catch { /* fall through */ }
+  return ct.includes('application/json');
+}
+async function readJsonOrText(res: Response) {
+  if (fetchIsJson(res)) {
+    try { return await res.json(); } catch {}
   }
   return await res.text();
 }
 
-// ---------- Frontegg API helpers
+function domainFromEmail(email: string) {
+  return email.split('@')[1]?.toLowerCase() || 'unknown';
+}
+function labelFromDomain(domain: string) {
+  const label = domain.split('.')[0] || domain;
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+function looksLikeUuid(id?: string) {
+  if (!id) return false;
+  return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(id);
+}
+
+ function extractEvent(payload: unknown) {
+  // Accept both:
+  //  - { key: 'frontegg.user.signedUp', data: { user, tenant? } }
+  //  - { eventKey: 'frontegg.user.signedUp', user, tenant? }
+  const obj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
+  const data = obj['data'] && typeof obj['data'] === 'object' ? (obj['data'] as Record<string, unknown>) : undefined;
+  const user = data?.['user'] && typeof data['user'] === 'object'
+    ? (data['user'] as Record<string, unknown>)
+    : obj['user'] && typeof obj['user'] === 'object'
+      ? (obj['user'] as Record<string, unknown>)
+      : undefined;
+  const tenant = data?.['tenant'] && typeof data['tenant'] === 'object'
+    ? (data['tenant'] as Record<string, unknown>)
+    : obj['tenant'] && typeof obj['tenant'] === 'object'
+      ? (obj['tenant'] as Record<string, unknown>)
+      : undefined;
+
+  const key = typeof obj['key'] === 'string' ? (obj['key'] as string)
+    : typeof obj['eventKey'] === 'string' ? (obj['eventKey'] as string)
+    : '';
+  const userId = user && typeof user['id'] === 'string' ? (user['id'] as string) : undefined;
+  const email = user && typeof user['email'] === 'string' ? (user['email'] as string).trim() : undefined;
+  const name = user && typeof user['name'] === 'string' ? (user['name'] as string).trim() : undefined;
+  const prehookTenantName = tenant && typeof tenant['name'] === 'string' ? (tenant['name'] as string).trim() : undefined;
+
+  return { key, userId, email, name, prehookTenantName };
+}
+
+// -------------------- Frontegg API
 
 async function getVendorToken() {
   const clientId = process.env.FRONTEGG_CLIENT_ID;
   const secret   = process.env.FRONTEGG_API_KEY;
-  if (!clientId || !secret) {
-    throw new Error('CONFIG: Missing FRONTEGG_CLIENT_ID or FRONTEGG_API_KEY');
-  }
+  if (!clientId || !secret) throw new Error('CONFIG: Missing FRONTEGG_CLIENT_ID or FRONTEGG_API_KEY');
+
   const res = await fetch(AUTH_VENDOR_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -114,11 +122,11 @@ async function getVendorToken() {
     cache: 'no-store',
   });
   if (!res.ok) {
-    const body = await fetchJsonOrText(res);
+    const body = await readJsonOrText(res);
     throw new Error(`AUTH_VENDOR ${res.status} – ${JSON.stringify(body)}`);
   }
   const json = (await res.json()) as { token?: string };
-  if (!json?.token) throw new Error('AUTH_VENDOR: token missing in response');
+  if (!json?.token) throw new Error('AUTH_VENDOR: token missing');
   return json.token!;
 }
 
@@ -132,7 +140,7 @@ async function findTenantByName(token: string, name: string) {
     cache: 'no-store',
   });
   if (!res.ok) {
-    const body = await fetchJsonOrText(res);
+    const body = await readJsonOrText(res);
     throw new Error(`TENANTS_V2 ${res.status} – ${JSON.stringify(body)}`);
   }
   const json: unknown = await res.json();
@@ -158,7 +166,7 @@ async function createTenant(token: string, name: string) {
     cache: 'no-store',
   });
   if (!res.ok) {
-    const body = await fetchJsonOrText(res);
+    const body = await readJsonOrText(res);
     throw new Error(`TENANTS_CREATE ${res.status} – ${JSON.stringify(body)}`);
   }
   return (await res.json()) as { tenantId: string; name: string };
@@ -176,115 +184,81 @@ async function ensureAppAssigned(token: string, tenantId: string) {
     body: JSON.stringify({ tenantId }),
     cache: 'no-store',
   });
+  // 409 = already assigned
   if (!res.ok && res.status !== 409) {
-    const body = await fetchJsonOrText(res);
+    const body = await readJsonOrText(res);
     throw new Error(`APP_ASSIGN ${res.status} – ${JSON.stringify(body)}`);
   }
 }
 
-// ----- Option B (primary): attach by userId
-async function addUserToTenantById(
-  token: string,
-  userId: string,
-  tenantId: string
-) {
+async function addUserToTenantById(token: string, userId: string, tenantId: string) {
   const res = await fetch(ADD_USER_TO_TENANT_URL(userId), {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'content-type': 'application/json',
     },
-    body: JSON.stringify({
-      tenantId,
-      skipInviteEmail: true,
-    }),
+    body: JSON.stringify({ tenantId, skipInviteEmail: true }),
     cache: 'no-store',
   });
+  if (res.ok) return;
 
-  if (!res.ok) {
-    const body = await fetchJsonOrText(res);
-    throw new Error(`ADD_USER_TO_TENANT ${res.status} – ${JSON.stringify(body)}`);
+  // Handle common idempotent states gracefully
+  if (res.status === 409) {
+    // Already in tenant
+    return;
   }
+
+  const body = await readJsonOrText(res);
+  // Some tests send "user-id" placeholder; Frontegg returns 404 ER-01089
+  if (res.status === 404) {
+    console.warn(`ADD_USER_TO_TENANT 404 (User not found). userId="${userId}" body=${JSON.stringify(body)}`);
+    return; // acknowledge to avoid webhook retries
+  }
+
+  throw new Error(`ADD_USER_TO_TENANT ${res.status} – ${JSON.stringify(body)}`);
 }
 
-// ----- Fallback only (if userId missing): invite by email into tenant
-async function addUserToTenantByEmail(
-  token: string,
-  tenantId: string,
-  email: string,
-  name?: string
-) {
-  const res = await fetch(USERS_BULK_INVITE_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-      'frontegg-tenant-id': tenantId, // required for bulk invite
-    },
-    body: JSON.stringify({
-      users: [
-        {
-          email,
-          name,
-          provider: 'local',
-          skipInviteEmail: true,
-          // Set to true only if your flow verifies email before this webhook:
-          verified: true,
-        },
-      ],
-    }),
-    cache: 'no-store',
-  });
-
-  if (!res.ok) {
-    const body = await fetchJsonOrText(res);
-    throw new Error(`BULK_INVITE ${res.status} – ${JSON.stringify(body)}`);
-  }
-}
-
-// ---------- Handlers
+// -------------------- route handlers
 
 export async function GET() {
   return new Response('OK (GET) – use POST for webhooks', { status: 200 });
 }
 
 export async function POST(req: NextRequest) {
-  // 1) Verify secret
   if (!verifySecret(req)) {
     return new Response('Invalid signature', { status: 401 });
   }
 
-  // 2) Parse payload
-   let payload: unknown;
+  let payload: unknown;
   try {
-    payload = await getBody(req);
+    payload = await readJson(req);
   } catch {
     return new Response('Bad JSON', { status: 400 });
   }
 
-  // 3) Extract info
-  const { key, userId, email, name, prehookTenantName } = extractEventInfo(payload);
+  const { key, userId, email, prehookTenantName } = extractEvent(payload);
 
-  // Only act on signedUp; acknowledge others
+  // Only act on the "user signed up" event
   if (key !== 'frontegg.user.signedUp') {
     return new Response('Ignored', { status: 204 });
   }
 
   if (!email) {
-    console.error('SIGNED_UP without email, payload:', JSON.stringify(payload).slice(0, 2000));
+    // We need email for domain-based tenant naming; but acknowledge to avoid retries
+    console.error('signedUp event missing email');
     return new Response('No email on event', { status: 200 });
   }
 
-  const tenantName = prehookTenantName || deriveTenantNameFromEmail(email);
+  // Use prehook-suggested tenant name if present; else derive from email domain
+  const tenantName = prehookTenantName || labelFromDomain(domainFromEmail(email));
 
-  // 4) Dry run support
+  // Optional dry-run
   if (DRY_RUN) {
-    console.log('[DRY_RUN] Would ensure tenant "%s", then add user %s (id=%s)',
-      tenantName, email, userId ?? 'n/a');
+    console.log('[DRY_RUN] Would ensure tenant "%s"; then add userId=%s (%s)', tenantName, userId, email);
     return new Response('OK (dry run)', { status: 200 });
   }
 
-  // 5) Do the work
   try {
     const token  = await getVendorToken();
     const found  = await findTenantByName(token, tenantName);
@@ -292,17 +266,18 @@ export async function POST(req: NextRequest) {
 
     await ensureAppAssigned(token, tenant.tenantId);
 
-    if (userId) {
-      await addUserToTenantById(token, userId, tenant.tenantId); // Option B (primary)
+    // Attach by userId only (no bulk invite path)
+    if (looksLikeUuid(userId)) {
+      await addUserToTenantById(token, userId!, tenant.tenantId);
     } else {
-      // Fallback if userId is missing for any reason
-      await addUserToTenantByEmail(token, tenant.tenantId, email, name);
+      // If the payload uses a placeholder like "user-id", log and acknowledge.
+      console.warn(`Invalid or missing userId "${userId}". Skipping attach for ${email}.`);
     }
 
     return new Response('OK', { status: 200 });
-   } catch (err: unknown) {
-     const msg = err instanceof Error ? err.message : String(err);
-     console.error('frontegg.webhook error:', msg);
-     return new Response(`Internal error: ${msg}`, { status: 500 });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('frontegg.webhook error:', msg);
+    return new Response(`Internal error: ${msg}`, { status: 500 });
   }
 }
