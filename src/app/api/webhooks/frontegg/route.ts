@@ -1,5 +1,6 @@
 // app/api/webhooks/frontegg/route.ts
 import type { NextRequest } from 'next/server';
+import jwt from 'jsonwebtoken';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -49,7 +50,13 @@ function verifySecret(req: NextRequest) {
   const header = req.headers.get('x-webhook-secret') || '';
   const secret = process.env.FRONTEGG_WEBHOOK_SECRET || '';
   if (!header || !secret) return false;
-  return header === secret;
+  if (header === secret) return true;
+  try {
+    jwt.verify(header, secret);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function readJson(req: NextRequest) {
