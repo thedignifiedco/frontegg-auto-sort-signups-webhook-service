@@ -86,8 +86,8 @@ function labelFromDomain(domain: string) {
 
  function extractEvent(payload: unknown) {
   // Accept both:
-  //  - { key: 'frontegg.user.invited', data: { user, tenant? } }
-  //  - { eventKey: 'frontegg.user.invited', user, tenant? }
+  //  - { key: 'frontegg.user.invitedToTenant', data: { user, tenant? } }
+  //  - { eventKey: 'frontegg.user.invitedToTenant', user, tenant? }
   const obj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
   const data = obj['data'] && typeof obj['data'] === 'object' ? (obj['data'] as Record<string, unknown>) : undefined;
   const context = obj['eventContext'] && typeof obj['eventContext'] === 'object'
@@ -320,8 +320,8 @@ export async function POST(req: NextRequest) {
 
   const { key, userId, email, prehookTenantName, contextAppId, tenantId } = extractEvent(payload);
 
-  // Only act on the "user invited" event
-  if (key !== 'frontegg.user.invited') {
+  // Only act on the "user invited to tenant" event
+  if (key !== 'frontegg.user.invitedToTenant') {
     return new Response('Ignored', { status: 204 });
   }
 
@@ -344,7 +344,7 @@ export async function POST(req: NextRequest) {
 
   if (!email) {
     // We need email for domain-based tenant naming; but acknowledge to avoid retries
-    console.error('invited event missing email');
+    console.error('invitedToTenant event missing email');
     return new Response('No email on event', { status: 200 });
   }
 

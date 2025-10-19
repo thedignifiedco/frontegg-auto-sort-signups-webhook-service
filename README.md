@@ -4,7 +4,7 @@ This repo contains a minimal Next.js API route that demonstrates how to process 
 
 ### What it does (high level)
 - Verifies incoming webhook requests using a shared secret via header `x-webhook-secret`.
-- Handles the `frontegg.user.invited` event.
+- Handles the `frontegg.user.invitedToTenant` event.
 - Filters webhooks to only process those from a specific target tenant ID.
 - Determines a target tenant name (from the user's email domain).
 - Ensures the target tenant exists and optionally assigns your default application to it.
@@ -33,7 +33,7 @@ This repo contains a minimal Next.js API route that demonstrates how to process 
 2) Parse and extract
    - Read `eventKey`, `user`, `eventContext`, and `tenantId` from various possible locations in the payload.
 3) Filter by event type
-   - Ignore events that are not `frontegg.user.invited`.
+   - Ignore events that are not `frontegg.user.invitedToTenant`.
 4) Filter by tenant ID
    - Only process webhooks where the tenant ID matches `DEFAULT_SRC_TENANT_ID`.
 5) Determine target tenant
@@ -66,7 +66,7 @@ curl -X POST 'http://localhost:3000/api/webhooks/frontegg' \
   -H 'Content-Type: application/json' \
   -H "x-webhook-secret: $FRONTEGG_WEBHOOK_SECRET" \
   -d '{
-    "eventKey": "frontegg.user.invited",
+    "eventKey": "frontegg.user.invitedToTenant",
     "user": { "id": "<USER_ID>", "email": "user@example.com" },
     "eventContext": { "userId": "<USER_ID>", "applicationId": "<APP_ID>", "tenantId": "<DEFAULT_SRC_TENANT_ID>" }
   }'
