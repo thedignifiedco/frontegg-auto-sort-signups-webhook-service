@@ -85,45 +85,43 @@ function labelFromDomain(domain: string) {
 // No UUID heuristic required; we just ensure userId exists
 
  function extractEvent(payload: unknown) {
-  // Accept both:
-  //  - { key: 'frontegg.user.invitedToTenant', data: { user, tenant? } }
-  //  - { eventKey: 'frontegg.user.invitedToTenant', user, tenant? }
+  // Expected payload structure:
+  // {
+  //   "eventKey": "frontegg.user.invitedToTenant",
+  //   "eventContext": {
+  //     "vendorId": "string | null",
+  //     "tenantId": "string | null", 
+  //     "userId": "string | null"
+  //   },
+  //   "user": {
+  //     "id": "string",
+  //     "email": "string",
+  //     "tenantId": "string",
+  //     ...
+  //   }
+  // }
   const obj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
-  const data = obj['data'] && typeof obj['data'] === 'object' ? (obj['data'] as Record<string, unknown>) : undefined;
   const context = obj['eventContext'] && typeof obj['eventContext'] === 'object'
     ? (obj['eventContext'] as Record<string, unknown>)
     : undefined;
-  const user = data?.['user'] && typeof data['user'] === 'object'
-    ? (data['user'] as Record<string, unknown>)
-    : obj['user'] && typeof obj['user'] === 'object'
-      ? (obj['user'] as Record<string, unknown>)
-      : undefined;
-  const tenant = data?.['tenant'] && typeof data['tenant'] === 'object'
-    ? (data['tenant'] as Record<string, unknown>)
-    : obj['tenant'] && typeof obj['tenant'] === 'object'
-      ? (obj['tenant'] as Record<string, unknown>)
-      : undefined;
+  const user = obj['user'] && typeof obj['user'] === 'object'
+    ? (obj['user'] as Record<string, unknown>)
+    : undefined;
 
-  const key = typeof obj['key'] === 'string' ? (obj['key'] as string)
-    : typeof obj['eventKey'] === 'string' ? (obj['eventKey'] as string)
-    : '';
+  const key = typeof obj['eventKey'] === 'string' ? (obj['eventKey'] as string) : '';
   const userIdFromContext = context && typeof context['userId'] === 'string' ? (context['userId'] as string) : undefined;
   const userIdFromUser = user && typeof user['id'] === 'string' ? (user['id'] as string) : undefined;
   const userId = userIdFromContext ?? userIdFromUser;
-  const contextAppId: string | undefined =
-    context && typeof context['applicationId'] === 'string'
-      ? (context['applicationId'] as string)
-      : undefined;
-  const email = user && typeof user['email'] === 'string' ? (user['email'] as string).trim() : undefined;
-  const prehookTenantName = tenant && typeof tenant['name'] === 'string' ? (tenant['name'] as string).trim() : undefined;
   
-  // Extract tenant ID from various possible locations
-  const tenantIdFromContext = context && typeof context['tenantId'] === 'string' ? (context['tenantId'] as string) : undefined;
-  const tenantIdFromTenant = tenant && typeof tenant['tenantId'] === 'string' ? (tenant['tenantId'] as string) : undefined;
-  const tenantIdFromData = data && typeof data['tenantId'] === 'string' ? (data['tenantId'] as string) : undefined;
-  const tenantId = tenantIdFromContext ?? tenantIdFromTenant ?? tenantIdFromData;
+  // Extract tenant ID from eventContext only
+  const tenantId = context && typeof context['tenantId'] === 'string' ? (context['tenantId'] as string) : undefined;
+  
+  const email = user && typeof user['email'] === 'string' ? (user['email'] as string).trim() : undefined;
+  
+  // For invitedToTenant events, we don't have a prehook tenant name, so we'll derive from email domain
+  const prehookTenantName = undefined;
 
-  return { key, userId, email, prehookTenantName, contextAppId, tenantId };
+  return { key, userId, email, prehookTenantName, contextAppId: undefined, tenantId };
 }
 
 // -------------------- Frontegg API
@@ -318,11 +316,11 @@ export async function POST(req: NextRequest) {
     return new Response('Bad JSON', { status: 400 });
   }
 
-  const { key, userId, email, prehookTenantName, contextAppId, tenantId } = extractEvent(payload);
+  const { key, userId, email, prehookTenantName, tenantId } = extractEvent(payload);
 
   // Only act on the "user invited to tenant" event
   if (key !== 'frontegg.user.invitedToTenant') {
-    return new Response('Ignored', { status: 204 });
+    return new Response(null, { status: 204 });
   }
 
   // Check if the webhook is from the target tenant
@@ -339,7 +337,7 @@ export async function POST(req: NextRequest) {
 
   if (tenantId !== srcTenantId) {
     console.log(`Ignoring webhook from tenant ${tenantId}, expected ${srcTenantId}`);
-    return new Response('Ignored - wrong tenant', { status: 204 });
+    return new Response(null, { status: 204 });
   }
 
   if (!email) {
@@ -369,13 +367,12 @@ export async function POST(req: NextRequest) {
       // Remove user from the source tenant (same as the tenant we're filtering for)
       await removeUserFromTenant(token, userId, srcTenantId);
 
-      // Final step: auto-disable if appId matches default app and user isn't first in target tenant
-      const defaultAppId = process.env.DEFAULT_APP_ID;
-      if (defaultAppId && contextAppId && contextAppId === defaultAppId) {
-        const notFirst = await isSecondOrLaterUserInTenant(token, tenant.tenantId);
-        if (notFirst) {
-          await disableUserInTenant(token, tenant.tenantId, userId);
-        }
+      // Final step: auto-disable if user isn't first in target tenant
+      // Note: For invitation events, we don't have applicationId context, so we'll disable
+      // all non-first users in the target tenant
+      const notFirst = await isSecondOrLaterUserInTenant(token, tenant.tenantId);
+      if (notFirst) {
+        await disableUserInTenant(token, tenant.tenantId, userId);
       }
     } else {
       console.warn('Missing userId; cannot add/remove/disable user in tenants');

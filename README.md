@@ -31,7 +31,8 @@ This repo contains a minimal Next.js API route that demonstrates how to process 
 1) Verify signature
    - Check `x-webhook-secret` against `FRONTEGG_WEBHOOK_SECRET` (PSK or HS‑signed JWT).
 2) Parse and extract
-   - Read `eventKey`, `user`, `eventContext`, and `tenantId` from various possible locations in the payload.
+   - Read `eventKey`, `user`, and `eventContext` from the payload.
+   - Extract `tenantId` from `eventContext.tenantId` only.
 3) Filter by event type
    - Ignore events that are not `frontegg.user.invitedToTenant`.
 4) Filter by tenant ID
@@ -45,7 +46,7 @@ This repo contains a minimal Next.js API route that demonstrates how to process 
 8) Remove user from source tenant
    - `DELETE /identity/resources/users/v1/{userId}` with header `frontegg-tenant-id: DEFAULT_SRC_TENANT_ID`.
 9) Optional auto‑disable
-   - If `eventContext.applicationId === DEFAULT_APP_ID` and the target tenant already has at least one user, call
+   - If the target tenant already has at least one user, call
      `POST /identity/resources/tenants/users/v1/{userId}/disable` with `frontegg-tenant-id: {targetTenantId}`.
 
 Notes:
@@ -68,7 +69,7 @@ curl -X POST 'http://localhost:3000/api/webhooks/frontegg' \
   -d '{
     "eventKey": "frontegg.user.invitedToTenant",
     "user": { "id": "<USER_ID>", "email": "user@example.com" },
-    "eventContext": { "userId": "<USER_ID>", "applicationId": "<APP_ID>", "tenantId": "<DEFAULT_SRC_TENANT_ID>" }
+    "eventContext": { "userId": "<USER_ID>", "tenantId": "<DEFAULT_SRC_TENANT_ID>" }
   }'
 ```
 
