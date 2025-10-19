@@ -11,9 +11,9 @@ export const dynamic = 'force-dynamic';
  *  - FRONTEGG_API_KEY
  *  - FRONTEGG_REGION_BASE           (e.g., https://api.frontegg.com)
  *  - FRONTEGG_WEBHOOK_SECRET        (PSK or JWT signing key; sent in x-webhook-secret)
+ *  - DEFAULT_SRC_TENANT_ID          (tenant ID to filter webhooks for and source tenant for removal)
  * Optional:
  *  - DEFAULT_APP_ID                 (assign app -> tenant)
- *  - DEFAULT_SRC_TENANT_ID          (source tenant for removal)
  *  - DRY_RUN=1                      (skip external API calls for debugging)
  */
 
@@ -86,8 +86,8 @@ function labelFromDomain(domain: string) {
 
  function extractEvent(payload: unknown) {
   // Accept both:
-  //  - { key: 'frontegg.user.signedUp', data: { user, tenant? } }
-  //  - { eventKey: 'frontegg.user.signedUp', user, tenant? }
+  //  - { key: 'frontegg.user.invited', data: { user, tenant? } }
+  //  - { eventKey: 'frontegg.user.invited', user, tenant? }
   const obj = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
   const data = obj['data'] && typeof obj['data'] === 'object' ? (obj['data'] as Record<string, unknown>) : undefined;
   const context = obj['eventContext'] && typeof obj['eventContext'] === 'object'
@@ -116,8 +116,14 @@ function labelFromDomain(domain: string) {
       : undefined;
   const email = user && typeof user['email'] === 'string' ? (user['email'] as string).trim() : undefined;
   const prehookTenantName = tenant && typeof tenant['name'] === 'string' ? (tenant['name'] as string).trim() : undefined;
+  
+  // Extract tenant ID from various possible locations
+  const tenantIdFromContext = context && typeof context['tenantId'] === 'string' ? (context['tenantId'] as string) : undefined;
+  const tenantIdFromTenant = tenant && typeof tenant['tenantId'] === 'string' ? (tenant['tenantId'] as string) : undefined;
+  const tenantIdFromData = data && typeof data['tenantId'] === 'string' ? (data['tenantId'] as string) : undefined;
+  const tenantId = tenantIdFromContext ?? tenantIdFromTenant ?? tenantIdFromData;
 
-  return { key, userId, email, prehookTenantName, contextAppId };
+  return { key, userId, email, prehookTenantName, contextAppId, tenantId };
 }
 
 // -------------------- Frontegg API
@@ -247,9 +253,9 @@ async function removeUserFromTenant(token: string, userId: string, tenantId: str
 
 async function isSecondOrLaterUserInTenant(token: string, tenantId: string) {
   const url = new URL(TENANT_USERS_URL);
-  // Try offset/limit style pagination to check if a second user exists
-  url.searchParams.set('offset', '1');
-  url.searchParams.set('limit', '1');
+  // Ask for up to 2 users starting from the first; if we get 2, there is a second user
+  url.searchParams.set('offset', '0');
+  url.searchParams.set('limit', '2');
   const res = await fetch(url.toString(), {
     method: 'GET',
     headers: {
@@ -264,11 +270,16 @@ async function isSecondOrLaterUserInTenant(token: string, tenantId: string) {
     throw new Error(`TENANT_USERS ${res.status} – ${JSON.stringify(body)}`);
   }
   const payload: unknown = await res.json();
-  // Consider it second-or-later if any item is returned at offset 1
-  if (Array.isArray(payload)) return payload.length > 0;
+  // Prefer total-style fields when present, else fall back to items length
+  if (Array.isArray(payload)) return payload.length >= 2;
   if (payload && typeof payload === 'object') {
-    const items = (payload as Record<string, unknown>)['items'];
-    return Array.isArray(items) && items.length > 0;
+    const obj = payload as Record<string, unknown>;
+    const totals = [obj['total'], obj['totalCount'], obj['count'], obj['recordsTotal']]
+      .map((v) => (typeof v === 'number' ? v : undefined))
+      .filter((v): v is number => typeof v === 'number');
+    if (totals.length > 0) return Math.max(...totals) >= 2;
+    const items = obj['items'];
+    if (Array.isArray(items)) return items.length >= 2;
   }
   return false;
 }
@@ -307,16 +318,33 @@ export async function POST(req: NextRequest) {
     return new Response('Bad JSON', { status: 400 });
   }
 
-  const { key, userId, email, prehookTenantName, contextAppId } = extractEvent(payload);
+  const { key, userId, email, prehookTenantName, contextAppId, tenantId } = extractEvent(payload);
 
-  // Only act on the "user signed up" event
-  if (key !== 'frontegg.user.signedUp') {
+  // Only act on the "user invited" event
+  if (key !== 'frontegg.user.invited') {
     return new Response('Ignored', { status: 204 });
+  }
+
+  // Check if the webhook is from the target tenant
+  const srcTenantId = process.env.DEFAULT_SRC_TENANT_ID;
+  if (!srcTenantId) {
+    console.error('DEFAULT_SRC_TENANT_ID environment variable is not set');
+    return new Response('Configuration error', { status: 500 });
+  }
+
+  if (!tenantId) {
+    console.error('No tenant ID found in webhook payload');
+    return new Response('No tenant ID in payload', { status: 400 });
+  }
+
+  if (tenantId !== srcTenantId) {
+    console.log(`Ignoring webhook from tenant ${tenantId}, expected ${srcTenantId}`);
+    return new Response('Ignored - wrong tenant', { status: 204 });
   }
 
   if (!email) {
     // We need email for domain-based tenant naming; but acknowledge to avoid retries
-    console.error('signedUp event missing email');
+    console.error('invited event missing email');
     return new Response('No email on event', { status: 200 });
   }
 
@@ -325,7 +353,7 @@ export async function POST(req: NextRequest) {
 
   // Optional dry-run
   if (DRY_RUN) {
-    console.log('[DRY_RUN] Would ensure tenant "%s"; then add user to target and remove from "%s"', tenantName, process.env.DEFAULT_SRC_TENANT_ID ?? 'MISSING');
+    console.log('[DRY_RUN] Would ensure tenant "%s"; then add user to target and remove from "%s"', tenantName, srcTenantId);
     return new Response('OK (dry run)', { status: 200 });
   }
 
@@ -338,12 +366,8 @@ export async function POST(req: NextRequest) {
 
     if (userId) {
       await addUserToTenantById(token, userId, tenant.tenantId);
-      const srcTenantId = process.env.DEFAULT_SRC_TENANT_ID;
-      if (srcTenantId) {
-        await removeUserFromTenant(token, userId, srcTenantId);
-      } else {
-        console.warn('DEFAULT_SRC_TENANT_ID not set; skipping removal from default tenant');
-      }
+      // Remove user from the source tenant (same as the tenant we're filtering for)
+      await removeUserFromTenant(token, userId, srcTenantId);
 
       // Final step: auto-disable if appId matches default app and user isn't first in target tenant
       const defaultAppId = process.env.DEFAULT_APP_ID;
