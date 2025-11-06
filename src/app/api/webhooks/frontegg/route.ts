@@ -249,6 +249,8 @@ async function removeUserFromTenant(token: string, userId: string, tenantId: str
   throw new Error(`REMOVE_USER ${res.status} – ${JSON.stringify(body)}`);
 }
 
+// TEMPORARILY DISABLED - Function kept for future re-enablement
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 async function isSecondOrLaterUserInTenant(token: string, tenantId: string) {
   const url = new URL(TENANT_USERS_URL);
   // Ask for up to 2 users starting from the first; if we get 2, there is a second user
@@ -282,6 +284,8 @@ async function isSecondOrLaterUserInTenant(token: string, tenantId: string) {
   return false;
 }
 
+// TEMPORARILY DISABLED - Function kept for future re-enablement
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 async function disableUserInTenant(token: string, tenantId: string, userId: string) {
   const res = await fetch(DISABLE_USER_URL(userId), {
     method: 'POST',
@@ -368,12 +372,13 @@ export async function POST(req: NextRequest) {
       await removeUserFromTenant(token, userId, srcTenantId);
 
       // Final step: auto-disable if user isn't first in target tenant
+      // TEMPORARILY DISABLED
       // Note: For invitation events, we don't have applicationId context, so we'll disable
       // all non-first users in the target tenant
-      const notFirst = await isSecondOrLaterUserInTenant(token, tenant.tenantId);
-      if (notFirst) {
-        await disableUserInTenant(token, tenant.tenantId, userId);
-      }
+      // const notFirst = await isSecondOrLaterUserInTenant(token, tenant.tenantId);
+      // if (notFirst) {
+      //   await disableUserInTenant(token, tenant.tenantId, userId);
+      // }
     } else {
       console.warn('Missing userId; cannot add/remove/disable user in tenants');
     }
